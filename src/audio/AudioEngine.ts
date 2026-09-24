@@ -26,6 +26,8 @@ export class AudioEngine {
   private startedAt = 0;
   /** buffer offset at which playback started */
   private offset = 0;
+  /** buffer currently being played (defaults to the decoded source buffer) */
+  private playbackBuffer: AudioBuffer | null = null;
   private stopAt: number | null = null;
   private stopTimer: number | null = null;
   playing = false;
@@ -69,16 +71,36 @@ export class AudioEngine {
   getTime(): number {
     if (!this.playing || !this.ctx) return this.offset;
     const t = this.offset + (this.ctx.currentTime - this.startedAt);
-    return Math.min(t, this.duration);
+    return Math.min(t, this.playbackBuffer?.duration ?? this.duration);
   }
 
-  play(from: number, to?: number, fade?: FadeSpec): void {
-    if (!this.buffer) return;
+  /**
+   * Select which buffer subsequent play() calls use. Pass null to restore
+   * the decoded source buffer (used when leaving processed-buffer audition).
+   */
+  setPlaybackBuffer(buffer: AudioBuffer | null): void {
+    this.playbackBuffer = buffer;
+  }
+
+  /** Lazily created / resumed AudioContext (for wrapping processed PCM). */
+  getContext(): AudioContext {
+    return this.ensureCtx();
+  }
+
+  /**
+   * Play an arbitrary buffer (defaults to the decoded source buffer). The
+   * processed-buffer path lets the muting panel audition the exact same PCM
+   * that gets exported; switching buffers always tears the previous source down
+   * first, so sounds never layer.
+   */
+  play(from: number, to?: number, fade?: FadeSpec, buffer?: AudioBuffer): void {
+    const target = buffer ?? this.playbackBuffer ?? this.buffer;
+    if (!target) return;
     const ctx = this.ensureCtx();
     this.stopSource();
     const source = ctx.createBufferSource();
-    source.buffer = this.buffer;
-    const dur = this.buffer.duration;
+    source.buffer = target;
+    const dur = target.duration;
     const start = Math.max(0, Math.min(from, dur));
     this.offset = start;
     this.stopAt = to !== undefined ? Math.min(to, dur) : null;

@@ -10,6 +10,15 @@ import {
 } from './audio/loudness';
 import { PeaksSupersededError, PeaksWorkerClient } from './audio/PeaksWorkerClient';
 import {
+  applyMuting,
+  clampMuteRegion,
+  encodeMutedWav,
+  pcmToAudioBuffer,
+  prepareMuteRanges,
+  type MuteRegion,
+  type MutedPcm,
+} from './audio/muting';
+import {
   RMS_WINDOW_SEC,
   computeRmsWindows,
   findSilenceSegments,
@@ -22,6 +31,7 @@ import { ChainBar } from './components/ChainBar';
 import { FadePanel } from './components/FadePanel';
 import { ImportDialog } from './components/ImportDialog';
 import { LoudnessPanel } from './components/LoudnessPanel';
+import { MutePanel } from './components/MutePanel';
 import { SilencePanel } from './components/SilencePanel';
 import { TransportBar } from './components/TransportBar';
 import { TranscriptPanel, type LoadedTranscript } from './components/TranscriptPanel';
@@ -41,7 +51,7 @@ import {
   type ImportPreview,
   type PreviewEntry,
 } from './utils/importChapters';
-import { formatTime } from './utils/time';
+import { formatTime, uid } from './utils/time';
 import {
   clipTranscriptCues,
   computeTranscriptCoverage,
@@ -50,6 +60,16 @@ import {
 
 const NUDGE_FINE = 0.05;
 const NUDGE_COARSE = 1;
+
+/** 比较两组消音标记是否逐 id 相同（用于判断处理结果是否过期）。 */
+function regionsEqual(a: MuteRegion[], b: MuteRegion[]): boolean {
+  if (a.length !== b.length) return false;
+  const byId = new Map(b.map((r) => [r.id, r]));
+  return a.every((r) => {
+    const o = byId.get(r.id);
+    return o && o.start === r.start && o.end === r.end;
+  });
+}
 
 export default function App() {
   const engineRef = useRef<AudioEngine | null>(null);
@@ -124,6 +144,20 @@ export default function App() {
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
   // 连续选择两个逐字稿时，先完成读取的旧文件不得覆盖新选择
   const transcriptTokenRef = useRef(0);
+
+  // ---- 敏感片段消音：用户标记（秒）+ 处理结果（试听与下载同源）----
+  const [muteRegions, setMuteRegions] = useState<MuteRegion[]>([]);
+  const [muteError, setMuteError] = useState<string | null>(null);
+  /** 最近一次「生成消音音频」的结果 PCM；标记再变动即作废（与 stale 配套） */
+  const mutedPcmRef = useRef<MutedPcm | null>(null);
+  const [mutedResult, setMutedResult] = useState<MutedPcm | null>(null);
+  /** 处理结果是否相对当前标记已过期 */
+  const [muteStale, setMuteStale] = useState(false);
+  /** 试听用的处理后 AudioBuffer（与 mutedPcmRef 同一份 PCM） */
+  const mutedBufferRef = useRef<AudioBuffer | null>(null);
+  const [auditioning, setAuditioning] = useState(false);
+  /** 停止试听并切回原始缓冲（供载入新音频等场景复用） */
+  const stopAuditionRef = useRef<(restoreOriginal?: boolean) => void>(() => {});
 
   /** 弹出一条临时提示；同一手势内相同 key 的提示不重复弹出。 */
   const showNotice = useCallback((msg: string, key: string, durationMs = 2200) => {
@@ -232,6 +266,13 @@ export default function App() {
     engine.onEnded = () => {
       previewRef.current = null;
       setPlaying(false);
+      setAuditioning((a) => {
+        if (a) {
+          engine.setPlaybackBuffer(null);
+          return false;
+        }
+        return a;
+      });
     };
     let raf = 0;
     const tick = () => {
@@ -292,6 +333,16 @@ export default function App() {
         if (token !== loadTokenRef.current) return; // 已被更新的选择取代
         resetChapters();
         previewRef.current = null;
+        // 载入新音频：清空消音标记与处理结果（标记是按旧缓冲记录的，不跨文件保留）
+        stopAuditionRef.current?.(false);
+        mutedPcmRef.current = null;
+        mutedFromRegionsRef.current = null;
+        mutedBufferRef.current = null;
+        setMuteRegions([]);
+        setMuteError(null);
+        setMutedResult(null);
+        setMuteStale(false);
+        setAuditioning(false);
         currentBufferRef.current = buffer;
         // 复用同一份解码 PCM 做静音与音量质检（不重新解码）
         setRmsWindows(computeRmsWindows(buffer));
@@ -447,8 +498,21 @@ export default function App() {
     [transcript, chapters],
   );
 
+  /** 停止试听并切回原始缓冲；restoreOriginal=false 时只停声、不切缓冲（载入新文件场景）。 */
+  const stopAudition = useCallback(
+    (restoreOriginal = true) => {
+      engine.stop();
+      if (restoreOriginal) engine.setPlaybackBuffer(null);
+      setAuditioning(false);
+    },
+    [engine],
+  );
+  stopAuditionRef.current = stopAudition;
+
   const seek = useCallback(
     (t: number) => {
+      // 试听处理后音频时点波形：停止试听、切回原始缓冲，再按普通逻辑跳转
+      stopAudition();
       const wasPlaying = engine.playing;
       engine.stop();
       previewRef.current = null;
@@ -460,12 +524,21 @@ export default function App() {
         setPlaying(false);
       }
     },
-    [engine],
+    [engine, stopAudition],
   );
 
   const togglePlay = useCallback(() => {
     if (!engine.hasBuffer) return;
     previewRef.current = null;
+    if (auditioning) {
+      // 试听中按主播放键：停止试听并切回原始音频，从当前位置播放
+      const t = engine.getTime();
+      stopAudition();
+      engine.play(t);
+      setPlayhead(t);
+      setPlaying(true);
+      return;
+    }
     if (engine.playing) {
       const t = engine.pause();
       setPlayhead(t);
@@ -474,7 +547,7 @@ export default function App() {
       engine.play(playhead >= duration - 0.05 ? 0 : playhead);
       setPlaying(true);
     }
-  }, [engine, playhead, duration]);
+  }, [engine, playhead, duration, auditioning, stopAudition]);
 
   /**
    * Preview a chapter interval. When fades are enabled for the chapter, the
@@ -485,6 +558,7 @@ export default function App() {
   const previewChapter = useCallback(
     (c: Chapter, from?: number) => {
       if (!engine.hasBuffer) return;
+      stopAudition();
       const start = from ?? c.start;
       const fade = fades[c.id];
       previewRef.current = { chapterId: c.id, from: start };
@@ -496,7 +570,7 @@ export default function App() {
       setPlayhead(start);
       setPlaying(true);
     },
-    [engine, fades],
+    [engine, fades, stopAudition],
   );
 
   const previewSelection = useCallback(() => {
@@ -529,12 +603,13 @@ export default function App() {
   const previewFrom = useCallback(
     (t: number) => {
       if (!engine.hasBuffer) return;
+      stopAudition();
       previewRef.current = null;
       engine.play(t);
       setPlayhead(t);
       setPlaying(true);
     },
-    [engine],
+    [engine, stopAudition],
   );
 
   /** From the list status pill: preview the chapter from its first issue. */
@@ -546,6 +621,140 @@ export default function App() {
     },
     [engine, chapterLoudness, previewChapter],
   );
+
+  // ---- 敏感片段消音 ----
+  /**
+   * 标记发生任何增删改：保留原始 AudioBuffer 与现有章节不动，仅作废已生成的
+   * 处理结果（试听停止、结果进入过期态，等待重新「生成消音音频」）。
+   */
+  const invalidateMuteResult = useCallback(() => {
+    engine.stop();
+    engine.setPlaybackBuffer(null);
+    setAuditioning(false);
+    mutedPcmRef.current = null;
+    mutedFromRegionsRef.current = null;
+    mutedBufferRef.current = null;
+    setMutedResult(null);
+    setMuteStale(false);
+  }, [engine]);
+
+  const addMuteRegion = useCallback(
+    (start: number, end: number) => {
+      const clipped = clampMuteRegion(start, end, duration);
+      if (!clipped) {
+        setMuteError('消音区间无效：需为有限秒数，且起点早于终点（并落在音频范围内）。');
+        return;
+      }
+      setMuteError(null);
+      invalidateMuteResult();
+      setMuteRegions((prev) => [...prev, { id: uid(), start: clipped.start, end: clipped.end }]);
+    },
+    [duration, invalidateMuteResult],
+  );
+
+  const updateMuteRegion = useCallback(
+    (id: string, start: number, end: number) => {
+      const clipped = clampMuteRegion(start, end, duration);
+      if (!clipped) return;
+      setMuteError(null);
+      invalidateMuteResult();
+      setMuteRegions((prev) =>
+        prev.map((r) => (r.id === id ? { ...r, start: clipped.start, end: clipped.end } : r)),
+      );
+    },
+    [duration, invalidateMuteResult],
+  );
+
+  const removeMuteRegion = useCallback(
+    (id: string) => {
+      invalidateMuteResult();
+      setMuteRegions((prev) => prev.filter((r) => r.id !== id));
+    },
+    [invalidateMuteResult],
+  );
+
+  const clearMuteRegions = useCallback(() => {
+    invalidateMuteResult();
+    setMuteRegions([]);
+    setMuteError(null);
+  }, [invalidateMuteResult]);
+
+  /** 生成消音后的完整音频：一次计算，试听与下载共用这同一份 PCM。 */
+  const processMuting = useCallback(() => {
+    const buffer = currentBufferRef.current;
+    if (!buffer) {
+      setMuteError('尚未导入音频，无法处理消音区间。');
+      return;
+    }
+    try {
+      const snapshot = muteRegions.map((r) => ({ ...r }));
+      const pcm = applyMuting(buffer, muteRegions);
+      const audioBuffer = pcmToAudioBuffer(pcm, engine.getContext());
+      mutedPcmRef.current = pcm;
+      mutedFromRegionsRef.current = snapshot;
+      mutedBufferRef.current = audioBuffer;
+      setMutedResult(pcm);
+      setMuteStale(false);
+      setMuteError(null);
+    } catch (err) {
+      setMutedResult(null);
+      mutedPcmRef.current = null;
+      mutedFromRegionsRef.current = null;
+      mutedBufferRef.current = null;
+      setMuteError(err instanceof Error ? err.message : '消音处理失败。');
+    }
+  }, [engine, muteRegions]);
+
+  /** 试听处理后的完整音频（与下载同源）；再点一次停止。 */
+  const toggleAudition = useCallback(() => {
+    if (!mutedBufferRef.current) return;
+    if (auditioning) {
+      stopAudition();
+      return;
+    }
+    previewRef.current = null;
+    engine.setPlaybackBuffer(mutedBufferRef.current);
+    const from = playhead >= mutedBufferRef.current.duration - 0.05 ? 0 : playhead;
+    setPlayhead(from);
+    engine.play(from);
+    setPlaying(true);
+    setAuditioning(true);
+  }, [engine, auditioning, playhead, stopAudition]);
+
+  /** 下载处理后完整音频的 16-bit PCM WAV（总时长 / 声道 / 采样率不变）。 */
+  const downloadMutedWav = useCallback(() => {
+    const pcm = mutedPcmRef.current;
+    if (!pcm) return;
+    try {
+      const wav = encodeMutedWav(pcm);
+      const name = (fileName ?? 'podcast').replace(/\.[^.]+$/, '');
+      downloadBlob(
+        `${name}.muted.wav`,
+        new Blob([wav.buffer as ArrayBuffer], { type: 'audio/wav' }),
+      );
+    } catch (err) {
+      setMuteError(err instanceof Error ? err.message : 'WAV 编码失败，未下载文件。');
+    }
+  }, [fileName]);
+
+  // 标记生成后又被改动：当前标记与生成时的快照不同即过期，需重新生成。
+  // 用快照比较（而非「刚处理完」标志），不受渲染 / effect 时机影响。
+  const mutedFromRegionsRef = useRef<MuteRegion[] | null>(null);
+  useEffect(() => {
+    const from = mutedFromRegionsRef.current;
+    setMuteStale(from !== null && !regionsEqual(muteRegions, from));
+  }, [muteRegions]);
+
+  /** 波形叠加用：合并后的消音区间（秒），供画布着色。 */
+  const muteMergedRanges = useMemo(() => {
+    const buffer = currentBufferRef.current;
+    if (!buffer) return [];
+    const prepared = prepareMuteRanges(muteRegions, buffer);
+    return prepared.map((r) => ({
+      start: r.startFrame / buffer.sampleRate,
+      end: r.endFrame / buffer.sampleRate,
+    }));
+  }, [muteRegions, duration]);
 
   const addAtPlayhead = useCallback(() => {
     chaptersApi.createAtPlayhead(playhead);
@@ -781,6 +990,7 @@ export default function App() {
             follow={follow && playing}
             suggestions={showSuggestions ? suggestions : []}
             loudnessSegments={loudnessSegments}
+            muteRanges={muteMergedRanges}
             lockedIds={chaptersApi.lockedIds}
             onZoom={setPxPerSec}
             onSeek={seek}
@@ -845,6 +1055,24 @@ export default function App() {
                 onQuietDbChange={changeQuietThreshold}
                 onLoudDbChange={changeLoudThreshold}
                 onToggleShow={() => setShowLoudness((s) => !s)}
+              />
+              <MutePanel
+                playhead={playhead}
+                duration={duration}
+                regions={muteRegions}
+                merged={muteMergedRanges}
+                error={muteError}
+                hasResult={mutedResult !== null}
+                stale={muteStale}
+                auditioning={auditioning}
+                onAdd={addMuteRegion}
+                onUpdate={updateMuteRegion}
+                onRemove={removeMuteRegion}
+                onClear={clearMuteRegions}
+                onSeek={seek}
+                onProcess={processMuting}
+                onToggleAudition={toggleAudition}
+                onDownload={downloadMutedWav}
               />
               {selected ? (
                 <>

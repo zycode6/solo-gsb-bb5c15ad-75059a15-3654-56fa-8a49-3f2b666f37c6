@@ -16,6 +16,9 @@ const QUIET_FILL = 'rgba(240, 196, 25, 0.16)';
 const QUIET_STRIP = 'rgba(240, 196, 25, 0.9)';
 const LOUD_FILL = 'rgba(255, 107, 157, 0.18)';
 const LOUD_STRIP = 'rgba(255, 107, 157, 0.95)';
+/** 敏感片段消音：与音量质检的粉色区分，用红色 */
+const MUTE_FILL = 'rgba(248, 81, 73, 0.20)';
+const MUTE_STRIP = 'rgba(248, 81, 73, 0.95)';
 /** 连锁移动：被带动章节的虚线描边与止点墙颜色 */
 const CHAIN_AMBER = 'rgba(255, 184, 77, 0.95)';
 const CHAIN_FILL = 'rgba(255, 184, 77, 0.10)';
@@ -31,6 +34,8 @@ interface WaveformProps {
   suggestions: number[];
   /** continuous 过轻/过响 ranges to color on the waveform */
   loudnessSegments: LoudnessSegment[];
+  /** 消音区间（已合并，秒）：在波形上以红色条带标示 */
+  muteRanges: Array<{ start: number; end: number }>;
   /** 当前会话锁定的章节 id（连锁移动的固定止点） */
   lockedIds: ReadonlySet<string>;
   onZoom: (pxPerSec: number) => void;
@@ -84,6 +89,7 @@ export function Waveform(props: WaveformProps) {
     follow,
     suggestions,
     loudnessSegments,
+    muteRanges,
     lockedIds,
   } = props;
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -367,6 +373,19 @@ export function Waveform(props: WaveformProps) {
       ctx.fillRect(x0, waveTop + waveH - 5, x1 - x0, 5);
     }
 
+    // 敏感片段消音区间：红色填充 + 顶部实心条 + 两侧竖线（边界带 ≤20ms 包络）
+    for (const seg of muteRanges) {
+      const x0 = seg.start * pxPerSec - scrollLeft;
+      const x1 = seg.end * pxPerSec - scrollLeft;
+      if (x1 < 0 || x0 > w) continue;
+      ctx.fillStyle = MUTE_FILL;
+      ctx.fillRect(x0, waveTop, x1 - x0, waveH);
+      ctx.fillStyle = MUTE_STRIP;
+      ctx.fillRect(x0, waveTop, Math.max(1, x1 - x0), 4);
+      ctx.fillRect(x0, waveTop + 4, 2, waveH - 4);
+      ctx.fillRect(x1 - 2, waveTop + 4, 2, waveH - 4);
+    }
+
     // drag-create preview
     if (drag && drag.mode === 'create') {
       const a = Math.min(drag.startT, drag.curT) * pxPerSec - scrollLeft;
@@ -570,6 +589,7 @@ export function Waveform(props: WaveformProps) {
     duration,
     suggestions,
     loudnessSegments,
+    muteRanges,
     lockedIds,
     chainPreview,
   ]);
