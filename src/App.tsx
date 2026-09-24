@@ -16,12 +16,18 @@ import {
   splitGapsAtBoundaries,
   suggestSplitBoundaries,
 } from './audio/silence';
+import {
+  buildMuteFrameRanges,
+  processMuteChannelData,
+  type MuteRange,
+} from './audio/mute';
 import { Waveform } from './components/Waveform';
 import { ChapterList } from './components/ChapterList';
 import { ChainBar } from './components/ChainBar';
 import { FadePanel } from './components/FadePanel';
 import { ImportDialog } from './components/ImportDialog';
 import { LoudnessPanel } from './components/LoudnessPanel';
+import { MutePanel } from './components/MutePanel';
 import { SilencePanel } from './components/SilencePanel';
 import { TransportBar } from './components/TransportBar';
 import { TranscriptPanel, type LoadedTranscript } from './components/TranscriptPanel';
@@ -33,7 +39,7 @@ import {
   type ChainEditResult,
 } from './utils/chainOps';
 import { downloadBlob, downloadFile, toJSON, toWebVTT } from './utils/export';
-import { buildChapterAudioPack } from './utils/audioPack';
+import { buildChapterAudioPack, encodeWavPcm16 } from './utils/audioPack';
 import {
   applyImportedChapters,
   buildImportPreview,
@@ -41,7 +47,7 @@ import {
   type ImportPreview,
   type PreviewEntry,
 } from './utils/importChapters';
-import { formatTime } from './utils/time';
+import { formatTime, uid } from './utils/time';
 import {
   clipTranscriptCues,
   computeTranscriptCoverage,
@@ -124,6 +130,22 @@ export default function App() {
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
   // 连续选择两个逐字稿时，先完成读取的旧文件不得覆盖新选择
   const transcriptTokenRef = useRef(0);
+
+  // ---- 敏感片段消音：标记区间（秒）+ 处理结果缓存 ----
+  const [muteRanges, setMuteRanges] = useState<MuteRange[]>([]);
+  /** 与 muteRanges 同步的处理结果（AudioBuffer）；试听与下载共用这一份 */
+  const [processedBuffer, setProcessedBuffer] = useState<AudioBuffer | null>(null);
+  const [processedInfo, setProcessedInfo] = useState<{ segments: number; mutedSeconds: number } | null>(
+    null,
+  );
+  const [mutePreviewing, setMutePreviewing] = useState(false);
+  /** 当前是否正在播放处理结果（停止 / 跳转 / 切换音频时需要一并清理） */
+  const mutePreviewingRef = useRef(false);
+
+  const setMutePreview = useCallback((on: boolean) => {
+    mutePreviewingRef.current = on;
+    setMutePreviewing(on);
+  }, []);
 
   /** 弹出一条临时提示；同一手势内相同 key 的提示不重复弹出。 */
   const showNotice = useCallback((msg: string, key: string, durationMs = 2200) => {
@@ -231,6 +253,8 @@ export default function App() {
   useEffect(() => {
     engine.onEnded = () => {
       previewRef.current = null;
+      mutePreviewingRef.current = false;
+      setMutePreviewing(false);
       setPlaying(false);
     };
     let raf = 0;
@@ -287,6 +311,7 @@ export default function App() {
       setDecodeError(null);
       setPeaksError(null);
       setLoadPhase('decoding');
+      setMutePreview(false); // 无论解码成功与否，旧文件的消音试听都不再有效
       try {
         const buffer = await engine.decode(file);
         if (token !== loadTokenRef.current) return; // 已被更新的选择取代
@@ -394,6 +419,12 @@ export default function App() {
     transcriptTokenRef.current += 1;
     setTranscript(null);
     setTranscriptError(null);
+    // 消音标记按旧音频时长记录，不跨文件保留；处理结果与试听一并作废
+    setMuteRanges([]);
+    setProcessedBuffer(null);
+    setProcessedInfo(null);
+    mutePreviewingRef.current = false;
+    setMutePreviewing(false);
   }, [fileName]);
 
   // ---- 逐字稿：读取本地 WebVTT 并按当前时长裁剪；不会产生任何章节 ----
@@ -452,6 +483,7 @@ export default function App() {
       const wasPlaying = engine.playing;
       engine.stop();
       previewRef.current = null;
+      setMutePreview(false);
       setPlayhead(t);
       if (wasPlaying) {
         engine.play(t);
@@ -460,12 +492,13 @@ export default function App() {
         setPlaying(false);
       }
     },
-    [engine],
+    [engine, setMutePreview],
   );
 
   const togglePlay = useCallback(() => {
     if (!engine.hasBuffer) return;
     previewRef.current = null;
+    setMutePreview(false);
     if (engine.playing) {
       const t = engine.pause();
       setPlayhead(t);
@@ -474,7 +507,7 @@ export default function App() {
       engine.play(playhead >= duration - 0.05 ? 0 : playhead);
       setPlaying(true);
     }
-  }, [engine, playhead, duration]);
+  }, [engine, playhead, duration, setMutePreview]);
 
   /**
    * Preview a chapter interval. When fades are enabled for the chapter, the
@@ -488,6 +521,7 @@ export default function App() {
       const start = from ?? c.start;
       const fade = fades[c.id];
       previewRef.current = { chapterId: c.id, from: start };
+      setMutePreview(false);
       if (fade?.enabled) {
         engine.play(start, c.end, { fadeIn: fade.fadeIn, fadeOut: fade.fadeOut });
       } else {
@@ -496,7 +530,7 @@ export default function App() {
       setPlayhead(start);
       setPlaying(true);
     },
-    [engine, fades],
+    [engine, fades, setMutePreview],
   );
 
   const previewSelection = useCallback(() => {
@@ -530,11 +564,12 @@ export default function App() {
     (t: number) => {
       if (!engine.hasBuffer) return;
       previewRef.current = null;
+      setMutePreview(false);
       engine.play(t);
       setPlayhead(t);
       setPlaying(true);
     },
-    [engine],
+    [engine, setMutePreview],
   );
 
   /** From the list status pill: preview the chapter from its first issue. */
@@ -655,6 +690,132 @@ export default function App() {
       );
     }
   }, [chapters, baseName, showNotice]);
+
+  // ---- 敏感片段消音：标记维护 + 处理 / 试听 / 下载 ----
+
+  /** 标记变化后作废旧处理结果；若正在试听旧结果则停止（不动其他播放）。 */
+  const invalidateProcessed = useCallback(() => {
+    setProcessedBuffer(null);
+    setProcessedInfo(null);
+    if (mutePreviewingRef.current) {
+      engine.stop();
+      setPlaying(false);
+      setMutePreview(false);
+    }
+  }, [engine, setMutePreview]);
+
+  const addMuteRange = useCallback(
+    (start: number, end: number) => {
+      setMuteRanges((prev) =>
+        [...prev, { id: uid(), start, end }].sort((a, b) => a.start - b.start || a.end - b.end),
+      );
+      invalidateProcessed();
+    },
+    [invalidateProcessed],
+  );
+
+  const updateMuteRange = useCallback(
+    (id: string, start: number, end: number) => {
+      setMuteRanges((prev) =>
+        prev
+          .map((r) => (r.id === id ? { ...r, start, end } : r))
+          .sort((a, b) => a.start - b.start || a.end - b.end),
+      );
+      invalidateProcessed();
+    },
+    [invalidateProcessed],
+  );
+
+  const removeMuteRange = useCallback(
+    (id: string) => {
+      setMuteRanges((prev) => prev.filter((r) => r.id !== id));
+      invalidateProcessed();
+    },
+    [invalidateProcessed],
+  );
+
+  const clearMuteRanges = useCallback(() => {
+    setMuteRanges([]);
+    invalidateProcessed();
+  }, [invalidateProcessed]);
+
+  /**
+   * 生成（或复用）与当前标记同步的处理结果：区间裁剪到音频范围、按采样帧
+   * 合并重叠 / 相接区间、起止各 ≤20ms 包络；总时长 / 声道数 / 采样率不变，
+   * 原始 AudioBuffer 不被修改。试听与下载都取这同一份结果。
+   */
+  const ensureProcessed = useCallback((): AudioBuffer | null => {
+    if (processedBuffer) return processedBuffer;
+    const buffer = currentBufferRef.current;
+    if (!buffer) {
+      showNotice('尚未导入音频，无法处理。', 'mute:nobuffer', 3000);
+      return null;
+    }
+    if (muteRanges.length === 0) {
+      showNotice('请先添加至少一个消音区间。', 'mute:empty', 3000);
+      return null;
+    }
+    try {
+      const result = processMuteChannelData(buffer, muteRanges);
+      const out = new AudioBuffer({
+        length: result.length,
+        numberOfChannels: result.numberOfChannels,
+        sampleRate: result.sampleRate,
+      });
+      for (let ch = 0; ch < result.numberOfChannels; ch++) {
+        out.getChannelData(ch).set(result.channels[ch]);
+      }
+      const merged = buildMuteFrameRanges(muteRanges, buffer);
+      const mutedFrames = merged.reduce((n, r) => n + (r.endFrame - r.startFrame), 0);
+      setProcessedBuffer(out);
+      setProcessedInfo({ segments: merged.length, mutedSeconds: mutedFrames / result.sampleRate });
+      return out;
+    } catch (err) {
+      showNotice(
+        err instanceof Error ? err.message : '消音处理失败。',
+        'mute:fail',
+        4000,
+      );
+      return null;
+    }
+  }, [processedBuffer, muteRanges, showNotice]);
+
+  /** 处理并从头试听处理结果（重复点击重建同一结果并重新播放）。 */
+  const previewProcessed = useCallback(() => {
+    const out = ensureProcessed();
+    if (!out) return;
+    previewRef.current = null;
+    engine.playBuffer(out, 0);
+    setPlayhead(0);
+    setPlaying(true);
+    setMutePreview(true);
+  }, [ensureProcessed, engine, setMutePreview]);
+
+  const stopMutePreview = useCallback(() => {
+    engine.stop();
+    setPlaying(false);
+    setMutePreview(false);
+  }, [engine, setMutePreview]);
+
+  /** 下载与试听相同的处理结果：完整音频编码为 16-bit PCM WAV。 */
+  const downloadProcessed = useCallback(() => {
+    const out = ensureProcessed();
+    if (!out) return;
+    try {
+      const wav = encodeWavPcm16(out, { startSample: 0, endSample: out.length });
+      downloadBlob(
+        `${baseName}.muted.wav`,
+        new Blob([wav.buffer as ArrayBuffer], { type: 'audio/wav' }),
+      );
+      showNotice('已导出处理后的完整音频（16-bit PCM WAV）。', `mute:ok:${Date.now()}`);
+    } catch (err) {
+      showNotice(
+        err instanceof Error ? err.message : 'WAV 编码失败，未下载任何文件。',
+        'mute:encfail',
+        4000,
+      );
+    }
+  }, [ensureProcessed, baseName, showNotice]);
 
   return (
     <div className="app" onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
@@ -845,6 +1006,23 @@ export default function App() {
                 onQuietDbChange={changeQuietThreshold}
                 onLoudDbChange={changeLoudThreshold}
                 onToggleShow={() => setShowLoudness((s) => !s)}
+              />
+              <MutePanel
+                ranges={muteRanges}
+                duration={duration}
+                playhead={playhead}
+                processedReady={processedBuffer !== null}
+                processedInfo={processedInfo}
+                previewing={mutePreviewing}
+                resetKey={fileName}
+                onAdd={addMuteRange}
+                onUpdate={updateMuteRange}
+                onRemove={removeMuteRange}
+                onClear={clearMuteRanges}
+                onPreview={previewProcessed}
+                onStopPreview={stopMutePreview}
+                onDownload={downloadProcessed}
+                onError={(msg) => showNotice(msg, `mute:invalid:${Date.now()}`, 3000)}
               />
               {selected ? (
                 <>

@@ -12,6 +12,8 @@ export class StaleDecodeError extends Error {
  * Thin wrapper around Web Audio API for buffer playback.
  * Supports full-file playback and segment (chapter) preview, optionally
  * with a fade-in/fade-out gain envelope fitted to the played segment.
+ * playBuffer() plays a one-off buffer (e.g. a processed preview) without
+ * replacing the decoded file buffer.
  */
 export class AudioEngine {
   private ctx: AudioContext | null = null;
@@ -22,6 +24,8 @@ export class AudioEngine {
   private gain: GainNode | null = null;
   /** per-preview fade envelope node (source -> env -> gain) */
   private env: GainNode | null = null;
+  /** buffer the CURRENT source is playing (decoded buffer or a one-off preview buffer) */
+  private activeBuffer: AudioBuffer | null = null;
   /** ctx.currentTime at which playback started */
   private startedAt = 0;
   /** buffer offset at which playback started */
@@ -65,20 +69,33 @@ export class AudioEngine {
     return this.buffer !== null;
   }
 
-  /** Current playback position in seconds (buffer timeline). */
+  /** Current playback position in seconds (timeline of the buffer being played). */
   getTime(): number {
     if (!this.playing || !this.ctx) return this.offset;
     const t = this.offset + (this.ctx.currentTime - this.startedAt);
-    return Math.min(t, this.duration);
+    return Math.min(t, this.activeBuffer?.duration ?? this.duration);
   }
 
   play(from: number, to?: number, fade?: FadeSpec): void {
     if (!this.buffer) return;
+    this.startSource(this.buffer, from, to, fade);
+  }
+
+  /**
+   * Play a one-off buffer that is NOT the decoded file (e.g. the processed
+   * mute preview). The decoded buffer stays untouched; the next play() call
+   * transparently switches back to it.
+   */
+  playBuffer(buffer: AudioBuffer, from = 0, to?: number): void {
+    this.startSource(buffer, from, to, undefined);
+  }
+
+  private startSource(buffer: AudioBuffer, from: number, to?: number, fade?: FadeSpec): void {
     const ctx = this.ensureCtx();
     this.stopSource();
     const source = ctx.createBufferSource();
-    source.buffer = this.buffer;
-    const dur = this.buffer.duration;
+    source.buffer = buffer;
+    const dur = buffer.duration;
     const start = Math.max(0, Math.min(from, dur));
     this.offset = start;
     this.stopAt = to !== undefined ? Math.min(to, dur) : null;
@@ -119,6 +136,7 @@ export class AudioEngine {
       source.start(t0, start);
     }
     this.source = source;
+    this.activeBuffer = buffer;
     this.startedAt = t0;
     this.playing = true;
   }
@@ -141,6 +159,7 @@ export class AudioEngine {
     if (this.source) {
       const s = this.source;
       this.source = null;
+      this.activeBuffer = null;
       this.playing = false;
       try {
         s.stop();

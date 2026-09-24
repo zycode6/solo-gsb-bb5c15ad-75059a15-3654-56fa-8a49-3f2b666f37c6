@@ -1015,3 +1015,99 @@ b.imp-status-valid {
   color: var(--muted);
   font-size: 12px;
 }
+
+/* ---- 敏感片段消音 ---- */
+.mute-panel .mute-draft-times {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mute-panel input[type='number'] {
+  width: 84px;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 5px 8px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.mute-draft-times input {
+  flex: 1;
+  min-width: 0;
+}
+
+.mute-sep {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.mute-draft-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.mute-draft-buttons button {
+  flex: 1;
+  padding: 5px 6px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.mute-range-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.mute-range-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.mute-idx {
+  color: var(--muted);
+  min-width: 16px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.mute-range-row input {
+  width: 72px;
+  flex-shrink: 1;
+  min-width: 0;
+}
+
+.mute-dur {
+  flex: 1;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.mute-del {
+  padding: 2px 8px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.mute-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mute-actions button {
+  font-size: 12px;
+  padding: 5px 10px;
+}
